@@ -176,6 +176,8 @@ type RemoteManagement struct {
 	AllowRemote bool `yaml:"allow-remote"`
 	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
 	SecretKey string `yaml:"secret-key"`
+	// PublicAuthUpload configures the upload-only public auth page and API.
+	PublicAuthUpload PublicAuthUpload `yaml:"public-auth-upload"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
 	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
@@ -184,6 +186,15 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+// PublicAuthUpload holds the limited upload-only public auth page configuration.
+type PublicAuthUpload struct {
+	// Enabled toggles the upload-only public auth page and API.
+	Enabled bool `yaml:"enabled"`
+	// SecretKey is the upload-only key accepted by the public auth upload endpoint.
+	// Plaintext values are bcrypt-hashed on startup.
+	SecretKey string `yaml:"secret-key"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -617,6 +628,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
 		// Preserve YAML comments and ordering; update only the nested key.
 		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
+	}
+	if cfg.RemoteManagement.PublicAuthUpload.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.PublicAuthUpload.SecretKey) {
+		hashed, errHash := hashSecret(cfg.RemoteManagement.PublicAuthUpload.SecretKey)
+		if errHash != nil {
+			return nil, fmt.Errorf("failed to hash public auth upload key: %w", errHash)
+		}
+		cfg.RemoteManagement.PublicAuthUpload.SecretKey = hashed
+		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "public-auth-upload", "secret-key"}, hashed)
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)

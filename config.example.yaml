@@ -22,6 +22,18 @@ remote-management:
   # Leave empty to disable the Management API entirely (404 for all /v0/management routes).
   secret-key: ""
 
+  # Upload-only public auth page and API.
+  # This is separate from the main management key so you can let others upload auth files
+  # without giving them full management access.
+  public-auth-upload:
+    # When true, exposes GET /auth-upload.html and allows POST /v0/management/auth-files
+    # with the upload-only key.
+    enabled: false
+
+    # Upload-only key. If a plaintext value is provided here, it will be hashed on startup.
+    # The public page asks collaborators for this key; do not reuse the main secret-key here.
+    secret-key: ""
+
   # Disable the bundled management control panel asset download and HTTP route when true.
   disable-control-panel: false
 

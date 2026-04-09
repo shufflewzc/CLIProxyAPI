@@ -148,6 +148,11 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
+		publicUploadRequest := h.publicAuthUploadEnabled() &&
+			c.Request != nil &&
+			c.Request.Method == http.MethodPost &&
+			c.Request.URL != nil &&
+			c.Request.URL.Path == "/v0/management/auth-files"
 		cfg := h.cfg
 		var (
 			allowRemote bool
@@ -181,7 +186,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			}
 			h.attemptsMu.Unlock()
 
-			if !allowRemote {
+			if !allowRemote && !publicUploadRequest {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
 				return
 			}
@@ -202,28 +207,20 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				h.attemptsMu.Unlock()
 			}
 		}
-		if secretHash == "" && envSecret == "" {
+		if secretHash == "" && envSecret == "" && !publicUploadRequest {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management key not set"})
 			return
 		}
 
-		// Accept either Authorization: Bearer <key> or X-Management-Key
-		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
-			parts := strings.SplitN(ah, " ", 2)
-			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-				provided = parts[1]
-			} else {
-				provided = ah
-			}
-		}
-		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
-		}
+		provided := managementKeyFromRequest(c)
 
 		if provided == "" {
 			if !localClient {
 				fail()
+			}
+			if publicUploadRequest {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management or public upload key"})
+				return
 			}
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management key"})
 			return
@@ -236,6 +233,19 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 					return
 				}
 			}
+		}
+
+		if publicUploadRequest && compareProtectedSecret(provided, h.publicAuthUploadSecret()) {
+			if !localClient {
+				h.attemptsMu.Lock()
+				if ai := h.failedAttempts[clientIP]; ai != nil {
+					ai.count = 0
+					ai.blockedUntil = time.Time{}
+				}
+				h.attemptsMu.Unlock()
+			}
+			c.Next()
+			return
 		}
 
 		if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {
@@ -254,6 +264,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
 			if !localClient {
 				fail()
+			}
+			if publicUploadRequest {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management or public upload key"})
+				return
 			}
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management key"})
 			return

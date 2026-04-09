@@ -61,6 +61,8 @@ var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
+	errAuthFileExists     = errors.New("auth file already exists")
+	errInvalidAuthFile    = errors.New("invalid auth file")
 	errAuthFileNotFound   = errors.New("auth file not found")
 )
 
@@ -581,6 +583,32 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 
 // Upload auth file: multipart or raw JSON with ?name=
 func (h *Handler) UploadAuthFile(c *gin.Context) {
+	h.handleAuthFileUpload(c, true, true)
+}
+
+func uploadAuthFileErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errAuthFileMustBeJSON):
+		return http.StatusBadRequest
+	case errors.Is(err, errInvalidAuthFile):
+		return http.StatusBadRequest
+	case errors.Is(err, errAuthFileExists):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func uploadAuthFileErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, errAuthFileMustBeJSON):
+		return "file must be .json"
+	default:
+		return err.Error()
+	}
+}
+
+func (h *Handler) handleAuthFileUpload(c *gin.Context, allowOverwrite bool, allowRawJSON bool) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
@@ -593,12 +621,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
-			if errors.Is(errUpload, errAuthFileMustBeJSON) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
+		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0], allowOverwrite); errUpload != nil {
+			c.JSON(uploadAuthFileErrorStatus(errUpload), gin.H{"error": uploadAuthFileErrorMessage(errUpload)})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -608,16 +632,13 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			name, errUpload := h.storeUploadedAuthFile(ctx, file, allowOverwrite)
 			if errUpload != nil {
 				failureName := ""
 				if file != nil {
 					failureName = filepath.Base(file.Filename)
 				}
-				msg := errUpload.Error()
-				if errors.Is(errUpload, errAuthFileMustBeJSON) {
-					msg = "file must be .json"
-				}
+				msg := uploadAuthFileErrorMessage(errUpload)
 				failed = append(failed, gin.H{"name": failureName, "error": msg})
 				continue
 			}
@@ -639,6 +660,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
 		return
 	}
+	if !allowRawJSON {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "multipart upload required"})
+		return
+	}
 	name := strings.TrimSpace(c.Query("name"))
 	if isUnsafeAuthFileName(name) {
 		c.JSON(400, gin.H{"error": "invalid name"})
@@ -653,8 +678,8 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err = h.writeAuthFile(ctx, filepath.Base(name), data, allowOverwrite); err != nil {
+		c.JSON(uploadAuthFileErrorStatus(err), gin.H{"error": uploadAuthFileErrorMessage(err)})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
@@ -766,7 +791,7 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader, allowOverwrite bool) (string, error) {
 	if file == nil {
 		return "", fmt.Errorf("no file uploaded")
 	}
@@ -784,17 +809,24 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
+	if err := h.writeAuthFile(ctx, name, data, allowOverwrite); err != nil {
 		return "", err
 	}
 	return name, nil
 }
 
-func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte, allowOverwrite bool) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
 			dst = abs
+		}
+	}
+	if !allowOverwrite {
+		if _, err := os.Stat(dst); err == nil {
+			return errAuthFileExists
+		} else if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to inspect file: %w", err)
 		}
 	}
 	auth, err := h.buildAuthFromFileData(dst, data)
@@ -993,7 +1025,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid auth file: %w", err)
+		return nil, fmt.Errorf("%w: %v", errInvalidAuthFile, err)
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {

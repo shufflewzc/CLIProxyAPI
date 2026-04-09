@@ -63,6 +63,26 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
 }
 
+func hasConfiguredPublicAuthUpload(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.RemoteManagement.PublicAuthUpload.Enabled && strings.TrimSpace(cfg.RemoteManagement.PublicAuthUpload.SecretKey) != ""
+}
+
+func hasConfiguredManagementRoutes(cfg *config.Config, envManagementSecret bool, localPassword string) bool {
+	if envManagementSecret || localPassword != "" {
+		return true
+	}
+	if cfg == nil {
+		return false
+	}
+	if strings.TrimSpace(cfg.RemoteManagement.SecretKey) != "" {
+		return true
+	}
+	return hasConfiguredPublicAuthUpload(cfg)
+}
+
 // WithMiddleware appends additional Gin middleware during server construction.
 func WithMiddleware(mw ...gin.HandlerFunc) ServerOption {
 	return func(cfg *serverOptionConfig) {
@@ -295,9 +315,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Register management routes when configuration or environment secrets are available,
 	// or when a local management password is provided (e.g. TUI mode).
-	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
-	s.managementRoutesEnabled.Store(hasManagementSecret)
-	if hasManagementSecret {
+	hasManagementRoutes := hasConfiguredManagementRoutes(cfg, envManagementSecret, s.localPassword)
+	s.managementRoutesEnabled.Store(hasManagementRoutes)
+	if hasManagementRoutes {
 		s.registerManagementRoutes()
 	}
 
@@ -322,6 +342,7 @@ func (s *Server) setupRoutes() {
 	})
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/auth-upload.html", s.mgmt.ServePublicAuthUploadPage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -927,11 +948,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		util.SetLogLevel(cfg)
 	}
 
-	prevSecretEmpty := true
-	if oldCfg != nil {
-		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
-	}
-	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
+	prevRoutesEnabled := hasConfiguredManagementRoutes(oldCfg, s.envManagementSecret, s.localPassword)
+	newRoutesEnabled := hasConfiguredManagementRoutes(cfg, s.envManagementSecret, s.localPassword)
 	if s.envManagementSecret {
 		s.registerManagementRoutes()
 		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
@@ -941,21 +959,21 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	} else {
 		switch {
-		case prevSecretEmpty && !newSecretEmpty:
+		case !prevRoutesEnabled && newRoutesEnabled:
 			s.registerManagementRoutes()
 			if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-				log.Info("management routes enabled after secret key update")
+				log.Info("management routes enabled after management/upload access update")
 			} else {
 				s.managementRoutesEnabled.Store(true)
 			}
-		case !prevSecretEmpty && newSecretEmpty:
+		case prevRoutesEnabled && !newRoutesEnabled:
 			if s.managementRoutesEnabled.CompareAndSwap(true, false) {
-				log.Info("management routes disabled after secret key removal")
+				log.Info("management routes disabled after management/upload access removal")
 			} else {
 				s.managementRoutesEnabled.Store(false)
 			}
 		default:
-			s.managementRoutesEnabled.Store(!newSecretEmpty)
+			s.managementRoutesEnabled.Store(newRoutesEnabled)
 		}
 	}
 
