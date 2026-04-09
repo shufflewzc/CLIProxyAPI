@@ -2,6 +2,8 @@ package management
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -103,6 +105,50 @@ func TestPublicAuthUploadKeyCannotDeleteViaManagementEndpoint(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected status %d, got %d with body %s", http.StatusUnauthorized, rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicAuthUploadKeyCanListAuthFilesWithSanitizedFields(t *testing.T) {
+	h := newPublicUploadHandler(t)
+	if err := os.WriteFile(filepath.Join(h.cfg.AuthDir, "alpha.json"), []byte(`{"type":"codex","email":"alpha@example.com","note":"private"}`), 0o600); err != nil {
+		t.Fatalf("seed auth file: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), filepath.Join(h.cfg.AuthDir, "alpha.json"), nil); err != nil {
+		t.Fatalf("register auth file: %v", err)
+	}
+
+	engine := gin.New()
+	group := engine.Group("/v0/management")
+	group.Use(h.Middleware())
+	group.GET("/auth-files", h.ListAuthFiles)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	req.Header.Set("X-Public-Upload-Key", "upload-secret")
+	rec := httptest.NewRecorder()
+
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(payload.Files))
+	}
+	if _, ok := payload.Files[0]["email"]; ok {
+		t.Fatalf("expected sanitized response without email, got %v", payload.Files[0])
+	}
+	if _, ok := payload.Files[0]["note"]; ok {
+		t.Fatalf("expected sanitized response without note, got %v", payload.Files[0])
+	}
+	if got := payload.Files[0]["name"]; got != "alpha.json" {
+		t.Fatalf("expected name alpha.json, got %v", got)
 	}
 }
 

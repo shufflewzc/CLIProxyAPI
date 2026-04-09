@@ -244,14 +244,19 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	publicUploadView, _ := c.Get(publicUploadAccessContextKey)
+	publicUploadScoped := publicUploadView == true
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+		h.listAuthFilesFromDisk(c, publicUploadScoped)
 		return
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			if publicUploadScoped {
+				entry = sanitizeAuthFileEntryForPublicUpload(entry)
+			}
 			files = append(files, entry)
 		}
 	}
@@ -312,7 +317,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, publicUploadScoped bool) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -353,11 +358,38 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					}
 				}
 			}
+			if publicUploadScoped {
+				fileData = sanitizeAuthFileEntryForPublicUpload(fileData)
+			}
 
 			files = append(files, fileData)
 		}
 	}
 	c.JSON(200, gin.H{"files": files})
+}
+
+func sanitizeAuthFileEntryForPublicUpload(entry gin.H) gin.H {
+	if entry == nil {
+		return nil
+	}
+	safe := gin.H{}
+	copyIfPresent := func(key string) {
+		if value, ok := entry[key]; ok {
+			safe[key] = value
+		}
+	}
+	copyIfPresent("name")
+	copyIfPresent("type")
+	copyIfPresent("provider")
+	copyIfPresent("status")
+	copyIfPresent("disabled")
+	copyIfPresent("unavailable")
+	copyIfPresent("runtime_only")
+	copyIfPresent("source")
+	copyIfPresent("size")
+	copyIfPresent("modtime")
+	copyIfPresent("updated_at")
+	return safe
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {

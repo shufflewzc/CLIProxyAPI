@@ -50,6 +50,8 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 }
 
+const publicUploadAccessContextKey = "public_upload_access"
+
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
@@ -153,6 +155,12 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.Request.Method == http.MethodPost &&
 			c.Request.URL != nil &&
 			c.Request.URL.Path == "/v0/management/auth-files"
+		publicUploadListRequest := h.publicAuthUploadEnabled() &&
+			c.Request != nil &&
+			c.Request.Method == http.MethodGet &&
+			c.Request.URL != nil &&
+			c.Request.URL.Path == "/v0/management/auth-files"
+		publicUploadScopedRequest := publicUploadRequest || publicUploadListRequest
 		cfg := h.cfg
 		var (
 			allowRemote bool
@@ -186,7 +194,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			}
 			h.attemptsMu.Unlock()
 
-			if !allowRemote && !publicUploadRequest {
+			if !allowRemote && !publicUploadScopedRequest {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
 				return
 			}
@@ -207,7 +215,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				h.attemptsMu.Unlock()
 			}
 		}
-		if secretHash == "" && envSecret == "" && !publicUploadRequest {
+		if secretHash == "" && envSecret == "" && !publicUploadScopedRequest {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management key not set"})
 			return
 		}
@@ -218,7 +226,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			if !localClient {
 				fail()
 			}
-			if publicUploadRequest {
+			if publicUploadScopedRequest {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing management or public upload key"})
 				return
 			}
@@ -235,7 +243,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			}
 		}
 
-		if publicUploadRequest && compareProtectedSecret(provided, h.publicAuthUploadSecret()) {
+		if publicUploadScopedRequest && compareProtectedSecret(provided, h.publicAuthUploadSecret()) {
 			if !localClient {
 				h.attemptsMu.Lock()
 				if ai := h.failedAttempts[clientIP]; ai != nil {
@@ -244,6 +252,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 				}
 				h.attemptsMu.Unlock()
 			}
+			c.Set(publicUploadAccessContextKey, true)
 			c.Next()
 			return
 		}
@@ -265,7 +274,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			if !localClient {
 				fail()
 			}
-			if publicUploadRequest {
+			if publicUploadScopedRequest {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid management or public upload key"})
 				return
 			}
