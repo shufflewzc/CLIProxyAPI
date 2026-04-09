@@ -3,6 +3,7 @@ package responses
 import (
 	"bytes"
 	"context"
+	"fmt"
 
 	"github.com/tidwall/gjson"
 )
@@ -10,25 +11,23 @@ import (
 // ConvertCodexResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
 // to OpenAI Responses SSE events (response.*).
 
-func ConvertCodexResponseToOpenAIResponses(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) [][]byte {
+func ConvertCodexResponseToOpenAIResponses(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) []string {
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
-		out := make([]byte, 0, len(rawJSON)+len("data: "))
-		out = append(out, []byte("data: ")...)
-		out = append(out, rawJSON...)
-		return [][]byte{out}
+		out := fmt.Sprintf("data: %s", string(rawJSON))
+		return []string{out}
 	}
-	return [][]byte{rawJSON}
+	return []string{string(rawJSON)}
 }
 
 // ConvertCodexResponseToOpenAIResponsesNonStream builds a single Responses JSON
 // from a non-streaming OpenAI Chat Completions response.
-func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) []byte {
+func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) string {
 	rootResult := gjson.ParseBytes(rawJSON)
 	// Verify this is a response.completed event
 	if rootResult.Get("type").String() != "response.completed" {
-		return []byte{}
+		return ""
 	}
 	responseResult := rootResult.Get("response")
-	return []byte(responseResult.Raw)
+	return responseResult.Raw
 }

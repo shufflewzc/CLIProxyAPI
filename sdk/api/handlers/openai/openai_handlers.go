@@ -29,6 +29,18 @@ type OpenAIAPIHandler struct {
 	*handlers.BaseAPIHandler
 }
 
+var (
+	sseDataPrefix = []byte("data: ")
+	sseDataSuffix = []byte("\n\n")
+	sseDoneChunk  = []byte("data: [DONE]\n\n")
+)
+
+func writeSSEData(w http.ResponseWriter, payload []byte) {
+	_, _ = w.Write(sseDataPrefix)
+	_, _ = w.Write(payload)
+	_, _ = w.Write(sseDataSuffix)
+}
+
 // NewOpenAIAPIHandler creates a new OpenAI API handlers instance.
 // It takes an BaseAPIHandler instance as input and returns an OpenAIAPIHandler.
 //
@@ -191,58 +203,58 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 	}
 
 	// Create chat completions structure
-	out := []byte(`{"model":"","messages":[{"role":"user","content":""}]}`)
+	out := `{"model":"","messages":[{"role":"user","content":""}]}`
 
 	// Set model
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.SetBytes(out, "model", model.String())
+		out, _ = sjson.Set(out, "model", model.String())
 	}
 
 	// Set the prompt as user message content
-	out, _ = sjson.SetBytes(out, "messages.0.content", prompt)
+	out, _ = sjson.Set(out, "messages.0.content", prompt)
 
 	// Copy other parameters from completions to chat completions
 	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
-		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
+		out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
 	}
 
 	if temperature := root.Get("temperature"); temperature.Exists() {
-		out, _ = sjson.SetBytes(out, "temperature", temperature.Float())
+		out, _ = sjson.Set(out, "temperature", temperature.Float())
 	}
 
 	if topP := root.Get("top_p"); topP.Exists() {
-		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
+		out, _ = sjson.Set(out, "top_p", topP.Float())
 	}
 
 	if frequencyPenalty := root.Get("frequency_penalty"); frequencyPenalty.Exists() {
-		out, _ = sjson.SetBytes(out, "frequency_penalty", frequencyPenalty.Float())
+		out, _ = sjson.Set(out, "frequency_penalty", frequencyPenalty.Float())
 	}
 
 	if presencePenalty := root.Get("presence_penalty"); presencePenalty.Exists() {
-		out, _ = sjson.SetBytes(out, "presence_penalty", presencePenalty.Float())
+		out, _ = sjson.Set(out, "presence_penalty", presencePenalty.Float())
 	}
 
 	if stop := root.Get("stop"); stop.Exists() {
-		out, _ = sjson.SetRawBytes(out, "stop", []byte(stop.Raw))
+		out, _ = sjson.SetRaw(out, "stop", stop.Raw)
 	}
 
 	if stream := root.Get("stream"); stream.Exists() {
-		out, _ = sjson.SetBytes(out, "stream", stream.Bool())
+		out, _ = sjson.Set(out, "stream", stream.Bool())
 	}
 
 	if logprobs := root.Get("logprobs"); logprobs.Exists() {
-		out, _ = sjson.SetBytes(out, "logprobs", logprobs.Bool())
+		out, _ = sjson.Set(out, "logprobs", logprobs.Bool())
 	}
 
 	if topLogprobs := root.Get("top_logprobs"); topLogprobs.Exists() {
-		out, _ = sjson.SetBytes(out, "top_logprobs", topLogprobs.Int())
+		out, _ = sjson.Set(out, "top_logprobs", topLogprobs.Int())
 	}
 
 	if echo := root.Get("echo"); echo.Exists() {
-		out, _ = sjson.SetBytes(out, "echo", echo.Bool())
+		out, _ = sjson.Set(out, "echo", echo.Bool())
 	}
 
-	return out
+	return []byte(out)
 }
 
 // convertChatCompletionsResponseToCompletions converts chat completions API response back to completions format.
@@ -257,23 +269,23 @@ func convertChatCompletionsResponseToCompletions(rawJSON []byte) []byte {
 	root := gjson.ParseBytes(rawJSON)
 
 	// Base completions response structure
-	out := []byte(`{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`)
+	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
 
 	// Copy basic fields
 	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.SetBytes(out, "id", id.String())
+		out, _ = sjson.Set(out, "id", id.String())
 	}
 
 	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.SetBytes(out, "created", created.Int())
+		out, _ = sjson.Set(out, "created", created.Int())
 	}
 
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.SetBytes(out, "model", model.String())
+		out, _ = sjson.Set(out, "model", model.String())
 	}
 
 	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
+		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
 	}
 
 	// Convert choices from chat completions to completions format
@@ -313,10 +325,10 @@ func convertChatCompletionsResponseToCompletions(rawJSON []byte) []byte {
 
 	if len(choices) > 0 {
 		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRawBytes(out, "choices", choicesJSON)
+		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
 	}
 
-	return out
+	return []byte(out)
 }
 
 // convertChatCompletionsStreamChunkToCompletions converts a streaming chat completions chunk to completions format.
@@ -357,19 +369,19 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
 	}
 
 	// Base completions stream response structure
-	out := []byte(`{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`)
+	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
 
 	// Copy basic fields
 	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.SetBytes(out, "id", id.String())
+		out, _ = sjson.Set(out, "id", id.String())
 	}
 
 	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.SetBytes(out, "created", created.Int())
+		out, _ = sjson.Set(out, "created", created.Int())
 	}
 
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.SetBytes(out, "model", model.String())
+		out, _ = sjson.Set(out, "model", model.String())
 	}
 
 	// Convert choices from chat completions delta to completions format
@@ -408,15 +420,15 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
 
 	if len(choices) > 0 {
 		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRawBytes(out, "choices", choicesJSON)
+		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
 	}
 
 	// Copy usage if present
 	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
+		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
 	}
 
-	return out
+	return []byte(out)
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses
@@ -498,7 +510,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				// Stream closed without data? Send DONE or just headers.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+				_, _ = c.Writer.Write(sseDoneChunk)
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -508,7 +520,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			setSSEHeaders()
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			writeSSEData(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue streaming the rest
@@ -604,7 +616,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			if !ok {
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+				_, _ = c.Writer.Write(sseDoneChunk)
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -617,7 +629,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			// Write the first chunk
 			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
 			if converted != nil {
-				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
+				writeSSEData(c.Writer, converted)
 				flusher.Flush()
 			}
 
@@ -660,7 +672,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			writeSSEData(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
@@ -675,10 +687,10 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 				errText = errMsg.Error.Error()
 			}
 			body := handlers.BuildErrorResponseBody(status, errText)
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+			writeSSEData(c.Writer, body)
 		},
 		WriteDone: func() {
-			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+			_, _ = c.Writer.Write(sseDoneChunk)
 		},
 	})
 }

@@ -63,26 +63,6 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
 }
 
-func hasConfiguredPublicAuthUpload(cfg *config.Config) bool {
-	if cfg == nil {
-		return false
-	}
-	return cfg.RemoteManagement.PublicAuthUpload.Enabled && strings.TrimSpace(cfg.RemoteManagement.PublicAuthUpload.SecretKey) != ""
-}
-
-func hasConfiguredManagementRoutes(cfg *config.Config, envManagementSecret bool, localPassword string) bool {
-	if envManagementSecret || localPassword != "" {
-		return true
-	}
-	if cfg == nil {
-		return false
-	}
-	if strings.TrimSpace(cfg.RemoteManagement.SecretKey) != "" {
-		return true
-	}
-	return hasConfiguredPublicAuthUpload(cfg)
-}
-
 // WithMiddleware appends additional Gin middleware during server construction.
 func WithMiddleware(mw ...gin.HandlerFunc) ServerOption {
 	return func(cfg *serverOptionConfig) {
@@ -196,6 +176,8 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	memoryLimiter *memoryConcurrencyLimiter
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -271,6 +253,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		memoryLimiter:       newMemoryConcurrencyLimiter(cfg.MemoryConcurrency),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -315,9 +298,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Register management routes when configuration or environment secrets are available,
 	// or when a local management password is provided (e.g. TUI mode).
-	hasManagementRoutes := hasConfiguredManagementRoutes(cfg, envManagementSecret, s.localPassword)
-	s.managementRoutesEnabled.Store(hasManagementRoutes)
-	if hasManagementRoutes {
+	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
+	s.managementRoutesEnabled.Store(hasManagementSecret)
+	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
 
@@ -337,12 +320,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
-	s.engine.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
-	s.engine.GET("/auth-upload.html", s.mgmt.ServePublicAuthUploadPage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -352,6 +330,9 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	if mw := s.apiMemoryConcurrencyMiddleware(); mw != nil {
+		v1.Use(mw)
+	}
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -366,6 +347,9 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	if mw := s.apiMemoryConcurrencyMiddleware(); mw != nil {
+		v1beta.Use(mw)
+	}
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -383,7 +367,11 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
-	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
+	if mw := s.apiMemoryConcurrencyMiddleware(); mw != nil {
+		s.engine.POST("/v1internal:method", mw, geminiCLIHandlers.CLIHandler)
+	} else {
+		s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
+	}
 
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist
@@ -805,6 +793,13 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 	}
 }
 
+func (s *Server) apiMemoryConcurrencyMiddleware() gin.HandlerFunc {
+	if s == nil || s.memoryLimiter == nil {
+		return nil
+	}
+	return s.memoryLimiter.middleware()
+}
+
 // Start begins listening for and serving HTTP or HTTPS requests.
 // It's a blocking call and will only return on an unrecoverable error.
 //
@@ -853,6 +848,9 @@ func (s *Server) Stop(ctx context.Context) error {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
+	}
+	if s.memoryLimiter != nil {
+		s.memoryLimiter.close()
 	}
 
 	// Shutdown the HTTP server.
@@ -938,6 +936,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
+	if s.memoryLimiter != nil {
+		s.memoryLimiter.applyConfig(cfg.MemoryConcurrency)
+	}
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
@@ -948,8 +949,11 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		util.SetLogLevel(cfg)
 	}
 
-	prevRoutesEnabled := hasConfiguredManagementRoutes(oldCfg, s.envManagementSecret, s.localPassword)
-	newRoutesEnabled := hasConfiguredManagementRoutes(cfg, s.envManagementSecret, s.localPassword)
+	prevSecretEmpty := true
+	if oldCfg != nil {
+		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
+	}
+	newSecretEmpty := cfg.RemoteManagement.SecretKey == ""
 	if s.envManagementSecret {
 		s.registerManagementRoutes()
 		if s.managementRoutesEnabled.CompareAndSwap(false, true) {
@@ -959,21 +963,21 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	} else {
 		switch {
-		case !prevRoutesEnabled && newRoutesEnabled:
+		case prevSecretEmpty && !newSecretEmpty:
 			s.registerManagementRoutes()
 			if s.managementRoutesEnabled.CompareAndSwap(false, true) {
-				log.Info("management routes enabled after management/upload access update")
+				log.Info("management routes enabled after secret key update")
 			} else {
 				s.managementRoutesEnabled.Store(true)
 			}
-		case prevRoutesEnabled && !newRoutesEnabled:
+		case !prevSecretEmpty && newSecretEmpty:
 			if s.managementRoutesEnabled.CompareAndSwap(true, false) {
-				log.Info("management routes disabled after management/upload access removal")
+				log.Info("management routes disabled after secret key removal")
 			} else {
 				s.managementRoutesEnabled.Store(false)
 			}
 		default:
-			s.managementRoutesEnabled.Store(newRoutesEnabled)
+			s.managementRoutesEnabled.Store(!newSecretEmpty)
 		}
 	}
 

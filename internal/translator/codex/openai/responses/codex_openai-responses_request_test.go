@@ -1,10 +1,66 @@
 package responses
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertSystemRoleToDeveloper_InputNotArray(t *testing.T) {
+	testCases := []struct {
+		name string
+		json []byte
+	}{
+		{name: "absent", json: []byte(`{"model":"gpt-5.2"}`)},
+		{name: "string", json: []byte(`{"model":"gpt-5.2","input":"hello"}`)},
+		{name: "object", json: []byte(`{"model":"gpt-5.2","input":{"role":"system"}}`)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			output := convertSystemRoleToDeveloper(tc.json)
+			if !bytes.Equal(output, tc.json) {
+				t.Fatalf("expected unchanged bytes, got %s", string(output))
+			}
+		})
+	}
+}
+
+func TestConvertSystemRoleToDeveloper_NoSystemRoleKeepsBytes(t *testing.T) {
+	inputJSON := []byte(`{"model":"gpt-5.2","input":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"content":"missing role"},{"role":123}]}`)
+
+	output := convertSystemRoleToDeveloper(inputJSON)
+	if !bytes.Equal(output, inputJSON) {
+		t.Fatalf("expected unchanged bytes, got %s", string(output))
+	}
+}
+
+func TestConvertSystemRoleToDeveloper_SystemRoleOnlyChangesRole(t *testing.T) {
+	inputJSON := []byte(`{"model":"gpt-5.2","input":[{"role":"system","content":{"text":"rule"},"extra":1},{"role":"user","content":"hello"},{"content":"missing role"},{"role":123}]}`)
+
+	output := convertSystemRoleToDeveloper(inputJSON)
+	outputStr := string(output)
+
+	if got := gjson.Get(outputStr, "input.0.role").String(); got != "developer" {
+		t.Fatalf("expected input.0.role=developer, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.content.text").String(); got != "rule" {
+		t.Fatalf("expected input.0.content.text preserved, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.extra").Int(); got != 1 {
+		t.Fatalf("expected input.0.extra preserved, got %d", got)
+	}
+	if got := gjson.Get(outputStr, "input.1.role").String(); got != "user" {
+		t.Fatalf("expected input.1.role=user, got %q", got)
+	}
+	if gjson.Get(outputStr, "input.2.role").Exists() {
+		t.Fatalf("expected input.2.role to remain absent")
+	}
+	if got := gjson.Get(outputStr, "input.3.role").Raw; got != "123" {
+		t.Fatalf("expected numeric role preserved, got %s", got)
+	}
+}
 
 // TestConvertSystemRoleToDeveloper_BasicConversion tests the basic system -> developer role conversion
 func TestConvertSystemRoleToDeveloper_BasicConversion(t *testing.T) {
@@ -264,52 +320,6 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToCodex_NormalizesWebSearchPreview(t *testing.T) {
-	inputJSON := []byte(`{
-		"model": "gpt-5.4-mini",
-		"input": "find latest OpenAI model news",
-		"tools": [
-			{"type": "web_search_preview_2025_03_11"}
-		],
-		"tool_choice": {
-			"type": "allowed_tools",
-			"tools": [
-				{"type": "web_search_preview"},
-				{"type": "web_search_preview_2025_03_11"}
-			]
-		}
-	}`)
-
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
-
-	if got := gjson.GetBytes(output, "tools.0.type").String(); got != "web_search" {
-		t.Fatalf("tools.0.type = %q, want %q: %s", got, "web_search", string(output))
-	}
-	if got := gjson.GetBytes(output, "tool_choice.type").String(); got != "allowed_tools" {
-		t.Fatalf("tool_choice.type = %q, want %q: %s", got, "allowed_tools", string(output))
-	}
-	if got := gjson.GetBytes(output, "tool_choice.tools.0.type").String(); got != "web_search" {
-		t.Fatalf("tool_choice.tools.0.type = %q, want %q: %s", got, "web_search", string(output))
-	}
-	if got := gjson.GetBytes(output, "tool_choice.tools.1.type").String(); got != "web_search" {
-		t.Fatalf("tool_choice.tools.1.type = %q, want %q: %s", got, "web_search", string(output))
-	}
-}
-
-func TestConvertOpenAIResponsesRequestToCodex_NormalizesTopLevelToolChoicePreviewAlias(t *testing.T) {
-	inputJSON := []byte(`{
-		"model": "gpt-5.4-mini",
-		"input": "find latest OpenAI model news",
-		"tool_choice": {"type": "web_search_preview_2025_03_11"}
-	}`)
-
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
-
-	if got := gjson.GetBytes(output, "tool_choice.type").String(); got != "web_search" {
-		t.Fatalf("tool_choice.type = %q, want %q: %s", got, "web_search", string(output))
-	}
-}
-
 func TestUserFieldDeletion(t *testing.T) {
 	inputJSON := []byte(`{  
 		"model": "gpt-5.2",  
@@ -362,5 +372,94 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 
 	if gjson.Get(outputStr, "truncation").Exists() {
 		t.Fatalf("truncation should be removed for Codex compatibility")
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_InputStringWrapped(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"input": "hello from string"
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	outputStr := string(output)
+
+	if !gjson.Get(outputStr, "input").IsArray() {
+		t.Fatalf("expected input to be wrapped as array, got %s", gjson.Get(outputStr, "input").Raw)
+	}
+	if got := gjson.Get(outputStr, "input.0.type").String(); got != "message" {
+		t.Fatalf("expected input.0.type=message, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.role").String(); got != "user" {
+		t.Fatalf("expected input.0.role=user, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.content.0.type").String(); got != "input_text" {
+		t.Fatalf("expected input.0.content.0.type=input_text, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.content.0.text").String(); got != "hello from string" {
+		t.Fatalf("expected wrapped text preserved, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_InputArraySystemRoleConvertedAndUnknownFieldsPreserved(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"foo": {"bar": {"baz": 123}},
+		"input": [
+			{"role": "system", "content": {"text": "rule"}, "extra": 1, "nested": {"x": true}},
+			{"role": "user", "content": "hello"}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	outputStr := string(output)
+
+	if got := gjson.Get(outputStr, "foo.bar.baz").Int(); got != 123 {
+		t.Fatalf("expected unknown field foo.bar.baz preserved, got %d", got)
+	}
+
+	if got := gjson.Get(outputStr, "input.0.role").String(); got != "developer" {
+		t.Fatalf("expected input.0.role=developer, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.content.text").String(); got != "rule" {
+		t.Fatalf("expected input.0.content.text preserved, got %q", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.extra").Int(); got != 1 {
+		t.Fatalf("expected input.0.extra preserved, got %d", got)
+	}
+	if got := gjson.Get(outputStr, "input.0.nested.x").Bool(); got != true {
+		t.Fatalf("expected input.0.nested.x preserved, got %v", got)
+	}
+	if got := gjson.Get(outputStr, "input.1.role").String(); got != "user" {
+		t.Fatalf("expected input.1.role=user, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_RemovesTokenLimitAndUserAndContextManagement(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"user": "u-123",
+		"max_output_tokens": 42,
+		"max_completion_tokens": 43,
+		"temperature": 0.7,
+		"top_p": 0.9,
+		"context_management": [{"type": "compaction"}],
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	outputStr := string(output)
+
+	for _, path := range []string{
+		"user",
+		"max_output_tokens",
+		"max_completion_tokens",
+		"temperature",
+		"top_p",
+		"context_management",
+	} {
+		if gjson.Get(outputStr, path).Exists() {
+			t.Fatalf("expected %s to be removed, got %s", path, gjson.Get(outputStr, path).Raw)
+		}
 	}
 }

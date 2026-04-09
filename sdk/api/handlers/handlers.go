@@ -6,7 +6,6 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -51,6 +50,7 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	defaultOriginalRequestSpoolBytes = 1 << 20
 )
 
 type pinnedAuthContextKey struct{}
@@ -340,13 +340,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
-	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
 		go func() {
 			select {
 			case <-requestCtx.Done():
 				cancel()
-			case <-cancelCtx.Done():
+			case <-newCtx.Done():
 			}
 		}()
 	}
@@ -467,6 +466,20 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	c.Set("API_RESPONSE", bytes.Clone(data))
 }
 
+func prepareOriginalRequestOptions(rawJSON []byte) ([]byte, *coreexecutor.OriginalRequestBody) {
+	if len(rawJSON) == 0 {
+		return nil, nil
+	}
+	if len(rawJSON) <= defaultOriginalRequestSpoolBytes {
+		return rawJSON, nil
+	}
+	body, err := coreexecutor.NewOriginalRequestBody(rawJSON, defaultOriginalRequestSpoolBytes)
+	if err != nil || body == nil {
+		return rawJSON, nil
+	}
+	return nil, body
+}
+
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
@@ -474,6 +487,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -484,16 +498,20 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Model:   normalizedModel,
 		Payload: payload,
 	}
+	originalRequest, originalRequestBody := prepareOriginalRequestOptions(rawJSON)
+	if originalRequestBody != nil {
+		defer func() { _ = originalRequestBody.Cleanup() }()
+	}
 	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: rawJSON,
-		SourceFormat:    sdktranslator.FromString(handlerType),
+		Stream:              false,
+		Alt:                 alt,
+		OriginalRequest:     originalRequest,
+		OriginalRequestBody: originalRequestBody,
+		SourceFormat:        sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -521,6 +539,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -531,16 +550,20 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Model:   normalizedModel,
 		Payload: payload,
 	}
+	originalRequest, originalRequestBody := prepareOriginalRequestOptions(rawJSON)
+	if originalRequestBody != nil {
+		defer func() { _ = originalRequestBody.Cleanup() }()
+	}
 	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: rawJSON,
-		SourceFormat:    sdktranslator.FromString(handlerType),
+		Stream:              false,
+		Alt:                 alt,
+		OriginalRequest:     originalRequest,
+		OriginalRequestBody: originalRequestBody,
+		SourceFormat:        sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -572,6 +595,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	primeRequestTranslationCache(handlerType, rawJSON)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -582,16 +606,20 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Model:   normalizedModel,
 		Payload: payload,
 	}
+	originalRequest, originalRequestBody := prepareOriginalRequestOptions(rawJSON)
 	opts := coreexecutor.Options{
-		Stream:          true,
-		Alt:             alt,
-		OriginalRequest: rawJSON,
-		SourceFormat:    sdktranslator.FromString(handlerType),
+		Stream:              true,
+		Alt:                 alt,
+		OriginalRequest:     originalRequest,
+		OriginalRequestBody: originalRequestBody,
+		SourceFormat:        sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
-		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		if originalRequestBody != nil {
+			_ = originalRequestBody.Cleanup()
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -623,6 +651,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	go func() {
+		if originalRequestBody != nil {
+			defer func() { _ = originalRequestBody.Cleanup() }()
+		}
 		defer close(dataChan)
 		defer close(errChan)
 		sentPayload := false
@@ -701,7 +732,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
+							streamErr = retryErr
 						}
 					}
 
@@ -765,6 +796,11 @@ func validateSSEDataJSON(chunk []byte) error {
 		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
 	}
 	return nil
+}
+
+func primeRequestTranslationCache(handlerType string, rawJSON []byte) {
+	_ = handlerType
+	_ = rawJSON
 }
 
 func statusFromError(err error) int {
@@ -841,54 +877,6 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
-	}
-}
-
-func enrichAuthSelectionError(err error, providers []string, model string) error {
-	if err == nil {
-		return nil
-	}
-
-	var authErr *coreauth.Error
-	if !errors.As(err, &authErr) || authErr == nil {
-		return err
-	}
-
-	code := strings.TrimSpace(authErr.Code)
-	if code != "auth_not_found" && code != "auth_unavailable" {
-		return err
-	}
-
-	providerText := strings.Join(providers, ",")
-	if providerText == "" {
-		providerText = "unknown"
-	}
-	modelText := strings.TrimSpace(model)
-	if modelText == "" {
-		modelText = "unknown"
-	}
-
-	baseMessage := strings.TrimSpace(authErr.Message)
-	if baseMessage == "" {
-		baseMessage = "no auth available"
-	}
-	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
-
-	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
-	if strings.Contains(","+providerText+",", ",claude,") {
-		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
-	}
-
-	status := authErr.HTTPStatus
-	if status <= 0 {
-		status = http.StatusServiceUnavailable
-	}
-
-	return &coreauth.Error{
-		Code:       authErr.Code,
-		Message:    detail,
-		Retryable:  authErr.Retryable,
-		HTTPStatus: status,
 	}
 }
 

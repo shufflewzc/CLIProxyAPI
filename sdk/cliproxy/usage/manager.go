@@ -17,7 +17,6 @@ type Record struct {
 	AuthIndex   string
 	Source      string
 	RequestedAt time.Time
-	Latency     time.Duration
 	Failed      bool
 	Detail      Detail
 }

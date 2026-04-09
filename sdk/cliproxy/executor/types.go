@@ -19,6 +19,8 @@ const (
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// RequestSimHashMetadataKey stores the normalized request SimHash for simhash routing.
+	RequestSimHashMetadataKey = "request_simhash"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
@@ -45,6 +47,8 @@ type Options struct {
 	Query url.Values
 	// OriginalRequest preserves the inbound request bytes prior to translation.
 	OriginalRequest []byte
+	// OriginalRequestBody stores the inbound request body outside the hot path when needed.
+	OriginalRequestBody *OriginalRequestBody
 	// SourceFormat identifies the inbound schema.
 	SourceFormat sdktranslator.Format
 	// Metadata carries extra execution hints shared across selection and executors.

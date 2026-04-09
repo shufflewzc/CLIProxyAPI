@@ -98,9 +98,6 @@ func (AntigravityAuthenticator) Login(ctx context.Context, cfg *config.Config, o
 		defer manualPromptTimer.Stop()
 	}
 
-	var manualInputCh <-chan string
-	var manualInputErrCh <-chan error
-
 waitForCallback:
 	for {
 		select {
@@ -118,11 +115,10 @@ waitForCallback:
 				break waitForCallback
 			default:
 			}
-			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the antigravity callback URL (or press Enter to keep waiting): ")
-			continue
-		case input := <-manualInputCh:
-			manualInputCh = nil
-			manualInputErrCh = nil
+			input, errPrompt := opts.Prompt("Paste the antigravity callback URL (or press Enter to keep waiting): ")
+			if errPrompt != nil {
+				return nil, errPrompt
+			}
 			parsed, errParse := misc.ParseOAuthCallback(input)
 			if errParse != nil {
 				return nil, errParse
@@ -136,8 +132,6 @@ waitForCallback:
 				Error: parsed.Error,
 			}
 			break waitForCallback
-		case errManual := <-manualInputErrCh:
-			return nil, errManual
 		case <-timeoutTimer.C:
 			return nil, fmt.Errorf("antigravity: authentication timed out")
 		}

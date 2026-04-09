@@ -13,7 +13,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -42,11 +41,20 @@ type Config struct {
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
+	// DisableAuthRefresh disables proactive auth refresh for the entire instance.
+	// When true, the service does not start background auth auto-refresh and executors
+	// do not exchange refresh tokens for new access tokens. This is intended for
+	// passive/follower deployments that mirror auth files from another instance.
+	DisableAuthRefresh bool `yaml:"disable-auth-refresh" json:"disable-auth-refresh"`
+
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
+
+	// MemoryConcurrency dynamically adjusts request concurrency based on process RSS.
+	MemoryConcurrency MemoryConcurrencyConfig `yaml:"memory-concurrency" json:"memory-concurrency"`
 
 	// CommercialMode disables high-overhead HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
@@ -129,19 +137,13 @@ type Config struct {
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
-// ClaudeHeaderDefaults configures default header values injected into Claude API requests.
-// In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
-// the client omits them, while OS/Arch remain runtime-derived. When stabilized device
-// profiles are enabled, OS/Arch become the pinned platform baseline, while
-// UserAgent/PackageVersion/RuntimeVersion seed the upgradeable software fingerprint.
+// ClaudeHeaderDefaults configures default header values injected into Claude API requests
+// when the client does not send them. Update these when Claude Code releases a new version.
 type ClaudeHeaderDefaults struct {
-	UserAgent              string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion         string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
-	OS                     string `yaml:"os" json:"os"`
-	Arch                   string `yaml:"arch" json:"arch"`
-	Timeout                string `yaml:"timeout" json:"timeout"`
-	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	UserAgent      string `yaml:"user-agent" json:"user-agent"`
+	PackageVersion string `yaml:"package-version" json:"package-version"`
+	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
+	Timeout        string `yaml:"timeout" json:"timeout"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -170,31 +172,42 @@ type PprofConfig struct {
 	Addr string `yaml:"addr" json:"addr"`
 }
 
+// MemoryConcurrencyConfig throttles request concurrency using a memory feedback loop.
+type MemoryConcurrencyConfig struct {
+	// Enable toggles adaptive request gating.
+	Enable bool `yaml:"enable" json:"enable"`
+	// TargetMemoryMB is the desired RSS ceiling in megabytes.
+	TargetMemoryMB int `yaml:"target-memory-mb" json:"target-memory-mb"`
+	// InitialConcurrency is the starting request concurrency.
+	InitialConcurrency int `yaml:"initial-concurrency" json:"initial-concurrency"`
+	// MinConcurrency is the lowest allowed request concurrency.
+	MinConcurrency int `yaml:"min-concurrency" json:"min-concurrency"`
+	// MaxConcurrency is the highest allowed request concurrency.
+	MaxConcurrency int `yaml:"max-concurrency" json:"max-concurrency"`
+	// WaitTimeoutSeconds is how long a new request may wait for a slot before returning 429.
+	// Zero means fail immediately without waiting.
+	WaitTimeoutSeconds float64 `yaml:"wait-timeout-seconds" json:"wait-timeout-seconds"`
+	// CheckIntervalSeconds is the memory sampling interval.
+	CheckIntervalSeconds int `yaml:"check-interval-seconds" json:"check-interval-seconds"`
+}
+
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
 	AllowRemote bool `yaml:"allow-remote"`
 	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
 	SecretKey string `yaml:"secret-key"`
-	// PublicAuthUpload configures the upload-only public auth page and API.
-	PublicAuthUpload PublicAuthUpload `yaml:"public-auth-upload"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
-	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
-	// When false (the default), the background updater remains enabled; when true, the panel is only downloaded on first access if missing.
-	DisableAutoUpdatePanel bool `yaml:"disable-auto-update-panel"`
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
 }
 
-// PublicAuthUpload holds the limited upload-only public auth page configuration.
-type PublicAuthUpload struct {
-	// Enabled toggles the upload-only public auth page and API.
-	Enabled bool `yaml:"enabled"`
-	// SecretKey is the upload-only key accepted by the public auth upload endpoint.
-	// Plaintext values are bcrypt-hashed on startup.
-	SecretKey string `yaml:"secret-key"`
+// AuthRefreshEnabled reports whether this instance should proactively refresh auth tokens.
+// Nil configs default to enabled to preserve legacy behavior.
+func (cfg *Config) AuthRefreshEnabled() bool {
+	return cfg == nil || !cfg.DisableAuthRefresh
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -205,17 +218,38 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
-
-	// AntigravityCredits indicates whether to retry Antigravity quota_exhausted 429s once
-	// on the same credential with enabledCreditTypes=["GOOGLE_ONE_AI"].
-	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "success-rate", "simhash".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// SuccessRate configures the "success-rate" routing strategy.
+	SuccessRate RoutingSuccessRateConfig `yaml:"success-rate" json:"success-rate"`
+
+	// SimHash configures the simhash selector virtual pool behavior.
+	SimHash RoutingSimHashConfig `yaml:"simhash" json:"simhash"`
+}
+
+// RoutingSuccessRateConfig configures the success-rate selector.
+// The selector uses a time-decayed (EMA) success rate per auth and model.
+type RoutingSuccessRateConfig struct {
+	// HalfLifeSeconds is the EMA half-life in seconds. Default: 1800 (30 minutes).
+	HalfLifeSeconds int `yaml:"half-life-seconds" json:"half-life-seconds"`
+	// ExploreRate is the probability [0,1] of randomly exploring an auth candidate.
+	// Default: 0.02.
+	ExploreRate float64 `yaml:"explore-rate" json:"explore-rate"`
+}
+
+// RoutingSimHashConfig configures the simhash selector virtual pool behavior.
+type RoutingSimHashConfig struct {
+	// PoolSize defines the global virtual pool target size. Default: 10.
+	PoolSize int `yaml:"pool-size" json:"pool-size"`
+	// AdmitCooldownSeconds defines the minimum interval between admitting new available auths
+	// into the virtual pool after the pool has been filled at least once. Default: 1.
+	AdmitCooldownSeconds int `yaml:"admit-cooldown-seconds" json:"admit-cooldown-seconds"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -255,8 +289,8 @@ type AmpCode struct {
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
 	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
-	// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
-	// is used for the upstream Amp request.
+	// When a client authenticates with a key that matches an entry, that upstream key is used.
+	// If no match is found, falls back to UpstreamAPIKey (default behavior).
 	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys,omitempty" json:"upstream-api-keys,omitempty"`
 
 	// RestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
@@ -378,11 +412,6 @@ type ClaudeKey struct {
 
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
-
-	// ExperimentalCCHSigning enables opt-in final-body cch signing for cloaked
-	// Claude /v1/messages requests. It is disabled by default so upstream seed
-	// changes do not alter the proxy's legacy behavior.
-	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
 }
 
 func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
@@ -535,10 +564,6 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
-
-	// Thinking configures the thinking/reasoning capability for this model.
-	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
-	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
@@ -590,6 +615,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.DisableCooling = false
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
+	cfg.MemoryConcurrency.Enable = false
+	cfg.MemoryConcurrency.InitialConcurrency = 8
+	cfg.MemoryConcurrency.MinConcurrency = 1
+	cfg.MemoryConcurrency.MaxConcurrency = 64
+	cfg.MemoryConcurrency.WaitTimeoutSeconds = 10
+	cfg.MemoryConcurrency.CheckIntervalSeconds = 1
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
@@ -629,14 +660,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		// Preserve YAML comments and ordering; update only the nested key.
 		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
 	}
-	if cfg.RemoteManagement.PublicAuthUpload.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.PublicAuthUpload.SecretKey) {
-		hashed, errHash := hashSecret(cfg.RemoteManagement.PublicAuthUpload.SecretKey)
-		if errHash != nil {
-			return nil, fmt.Errorf("failed to hash public auth upload key: %w", errHash)
-		}
-		cfg.RemoteManagement.PublicAuthUpload.SecretKey = hashed
-		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "public-auth-upload", "secret-key"}, hashed)
-	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
@@ -646,6 +669,34 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
 		cfg.Pprof.Addr = DefaultPprofAddr
+	}
+
+	if cfg.MemoryConcurrency.InitialConcurrency <= 0 {
+		cfg.MemoryConcurrency.InitialConcurrency = 8
+	}
+	if cfg.MemoryConcurrency.MinConcurrency <= 0 {
+		cfg.MemoryConcurrency.MinConcurrency = 1
+	}
+	if cfg.MemoryConcurrency.MaxConcurrency <= 0 {
+		cfg.MemoryConcurrency.MaxConcurrency = 64
+	}
+	if cfg.MemoryConcurrency.MaxConcurrency < cfg.MemoryConcurrency.MinConcurrency {
+		cfg.MemoryConcurrency.MaxConcurrency = cfg.MemoryConcurrency.MinConcurrency
+	}
+	if cfg.MemoryConcurrency.InitialConcurrency < cfg.MemoryConcurrency.MinConcurrency {
+		cfg.MemoryConcurrency.InitialConcurrency = cfg.MemoryConcurrency.MinConcurrency
+	}
+	if cfg.MemoryConcurrency.InitialConcurrency > cfg.MemoryConcurrency.MaxConcurrency {
+		cfg.MemoryConcurrency.InitialConcurrency = cfg.MemoryConcurrency.MaxConcurrency
+	}
+	if cfg.MemoryConcurrency.WaitTimeoutSeconds < 0 {
+		cfg.MemoryConcurrency.WaitTimeoutSeconds = 10
+	}
+	if cfg.MemoryConcurrency.CheckIntervalSeconds <= 0 {
+		cfg.MemoryConcurrency.CheckIntervalSeconds = 1
+	}
+	if cfg.MemoryConcurrency.TargetMemoryMB <= 0 {
+		cfg.MemoryConcurrency.Enable = false
 	}
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
@@ -660,6 +711,21 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	// Sanitize routing config.
+	cfg.Routing.Strategy = strings.TrimSpace(cfg.Routing.Strategy)
+	if cfg.Routing.SuccessRate.HalfLifeSeconds <= 0 {
+		cfg.Routing.SuccessRate.HalfLifeSeconds = 1800
+	}
+	if cfg.Routing.SuccessRate.ExploreRate == 0 {
+		cfg.Routing.SuccessRate.ExploreRate = 0.02
+	}
+	if cfg.Routing.SuccessRate.ExploreRate < 0 {
+		cfg.Routing.SuccessRate.ExploreRate = 0
+	}
+	if cfg.Routing.SuccessRate.ExploreRate > 1 {
+		cfg.Routing.SuccessRate.ExploreRate = 1
+	}
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -671,9 +737,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
-
-	// Sanitize Claude header defaults.
-	cfg.SanitizeClaudeHeaderDefaults()
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
@@ -772,20 +835,6 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
-}
-
-// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
-// configured Claude fingerprint baseline values.
-func (cfg *Config) SanitizeClaudeHeaderDefaults() {
-	if cfg == nil {
-		return
-	}
-	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
-	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
-	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
-	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
-	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
-	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
@@ -1337,6 +1386,16 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "routing.success-rate.half-life-seconds":
+			return node.Value == "1800"
+		}
+	}
+
+	// Check float defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!float" {
+		switch fullPath {
+		case "routing.success-rate.explore-rate":
+			return node.Value == "0.02"
 		}
 	}
 
